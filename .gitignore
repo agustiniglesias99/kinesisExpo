@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# MediaPipe model (downloaded automatically on first run)
+hand_landmarker.task
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
