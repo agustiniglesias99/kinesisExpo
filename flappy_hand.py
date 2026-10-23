@@ -4,7 +4,8 @@ Open your hand, then close it into a fist: every open -> closed transition
 makes the bird flap. The webcam is read with OpenCV, hand landmarks come from
 MediaPipe's HandLandmarker and the game is drawn with pygame.
 
-Keyboard: SPACE also flaps (handy for testing), ESC quits.
+Keyboard: SPACE also flaps (handy for testing), F11 toggles fullscreen,
+ESC quits.
 """
 
 import math
@@ -31,7 +32,8 @@ MODEL_URL = (
 )
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
-WIDTH, HEIGHT = 480, 720
+FULLSCREEN = True        # start in fullscreen (F11 toggles)
+WIDTH, HEIGHT = 480, 720  # WIDTH is recomputed at startup to match the screen's aspect ratio
 FPS = 60
 GROUND_H = 80
 
@@ -66,9 +68,9 @@ HAND_CONNECTIONS = [
 def ensure_model():
     if os.path.exists(MODEL_PATH):
         return
-    print("Downloading hand landmark model (~8 MB)...")
+    print("Descargando el modelo de detección de manos (~8 MB)...")
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("Model saved to", MODEL_PATH)
+    print("Modelo guardado en", MODEL_PATH)
 
 
 # ----------------------------------------------------------------------------
@@ -240,9 +242,15 @@ def bird_hits(bird, rect):
 
 class Game:
     def __init__(self, tracker):
+        global WIDTH
         pygame.init()
         pygame.display.set_caption("Flappy Hand")
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        # Use the screen's aspect ratio so fullscreen has no black bars; SCALED
+        # stretches the HEIGHT-tall game surface to whatever the display is.
+        desk_w, desk_h = pygame.display.get_desktop_sizes()[0]
+        WIDTH = max(480, round(HEIGHT * desk_w / desk_h))
+        flags = pygame.SCALED | (pygame.FULLSCREEN if FULLSCREEN else 0)
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT), flags)
         self.clock = pygame.time.Clock()
         self.font_big = pygame.font.SysFont("arial", 56, bold=True)
         self.font = pygame.font.SysFont("arial", 24, bold=True)
@@ -316,7 +324,7 @@ class Game:
             self.screen.blit(pygame.transform.smoothscale(surf, (PREVIEW_W, PREVIEW_H)), (x, y))
         else:
             pygame.draw.rect(self.screen, (30, 30, 30), (x, y, PREVIEW_W, PREVIEW_H))
-            msg = "No camera" if not (self.tracker and self.tracker.available) else "Starting..."
+            msg = "Sin cámara" if not (self.tracker and self.tracker.available) else "Iniciando..."
             t = self.font_small.render(msg, True, (220, 220, 220))
             self.screen.blit(t, (x + 10, y + PREVIEW_H // 2 - 8))
         pygame.draw.rect(self.screen, (255, 255, 255), (x, y, PREVIEW_W, PREVIEW_H), 2)
@@ -324,11 +332,11 @@ class Game:
         if self.tracker and self.tracker.available:
             state = self.tracker.hand_state
             text, color = {
-                "open": ("OPEN hand", (80, 255, 120)),
-                "closed": ("FIST", (255, 90, 90)),
-                None: ("No hand", (220, 220, 220)),
+                "open": ("Mano ABIERTA", (80, 255, 120)),
+                "closed": ("PUÑO", (255, 90, 90)),
+                None: ("Sin mano", (220, 220, 220)),
             }[state]
-            t = self.font_small.render(f"{text}  ({self.tracker.fingers} fingers)", True, color)
+            t = self.font_small.render(f"{text}  ({self.tracker.fingers} dedos)", True, color)
             self.screen.blit(t, (x, y + PREVIEW_H + 4))
 
     def draw(self):
@@ -350,13 +358,14 @@ class Game:
             self.draw_text(str(self.score), self.font_big, 40)
         elif self.state == "ready":
             self.draw_text("FLAPPY HAND", self.font_big, 150, (255, 230, 0))
-            self.draw_text("Open your hand,", self.font, 430)
-            self.draw_text("then close it to flap!", self.font, 462)
+            self.draw_text("Abre la mano", self.font, 430)
+            self.draw_text("¡y ciérrala para saltar!", self.font, 462)
+            self.draw_text("F11: pantalla completa   ESC: salir", self.font_small, 520)
         else:
-            self.draw_text("GAME OVER", self.font_big, 180, (255, 90, 60))
-            self.draw_text(f"Score: {self.score}   Best: {self.best}", self.font, 260)
+            self.draw_text("FIN DEL JUEGO", self.font_big, 180, (255, 90, 60))
+            self.draw_text(f"Puntos: {self.score}   Récord: {self.best}", self.font, 260)
             if time.monotonic() - self.over_time > 1.0:
-                self.draw_text("Open & close your hand to retry", self.font, 430)
+                self.draw_text("Abre y cierra la mano para reintentar", self.font, 430)
 
         self.draw_preview()
         pygame.display.flip()
@@ -369,6 +378,8 @@ class Game:
                     return
                 if event.type == pygame.KEYDOWN and event.key in (pygame.K_SPACE, pygame.K_UP):
                     self.on_flap()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+                    pygame.display.toggle_fullscreen()
             if self.tracker:
                 for _ in range(self.tracker.consume_flaps()):
                     self.on_flap()
@@ -384,9 +395,9 @@ def main():
         if tracker.available:
             tracker.start()
         else:
-            print("Could not open the camera - keyboard only (SPACE to flap).")
+            print("No se pudo abrir la cámara - solo teclado (ESPACIO para saltar).")
     except Exception as exc:  # e.g. no internet to download the model
-        print("Hand tracking disabled:", exc)
+        print("Detección de manos desactivada:", exc)
         tracker = None
 
     try:

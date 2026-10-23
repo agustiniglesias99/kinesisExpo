@@ -26,6 +26,7 @@ downloaded next to the script.
 |---|---|
 | Open hand → fist | Flap / start / restart |
 | SPACE | Flap (keyboard fallback) |
+| F11 | Toggle fullscreen (starts in fullscreen; set `FULLSCREEN = False` to start windowed) |
 | ESC | Quit |
 
 The camera preview in the top-right corner shows the detected hand
