@@ -1,7 +1,7 @@
 """Flappy Bird controlled by your hand.
 
-Open your hand, then close it into a fist: every open -> closed transition
-makes the bird flap. The webcam is read with OpenCV, hand landmarks come from
+Open your hand fully, then close it into a full fist: every fully open ->
+fully closed transition makes the bird flap. Half-closed hands are ignored. The webcam is read with OpenCV, hand landmarks come from
 MediaPipe's HandLandmarker and the game is drawn with pygame.
 
 Keyboard: SPACE also flaps (handy for testing), F11 toggles fullscreen,
@@ -48,14 +48,17 @@ PIPE_INTERVAL = 1.8     # seconds between pipes
 
 PREVIEW_W, PREVIEW_H = 160, 120
 
-# Hysteresis for gesture detection (number of extended fingers)
-CLOSED_MAX_FINGERS = 1  # <= this many extended fingers -> fist
-OPEN_MIN_FINGERS = 3    # >= this many extended fingers -> open hand
+# Gesture detection. For each finger we measure
+#   ratio = distance(wrist, fingertip) / distance(wrist, knuckle)
+# in 3D, so it doesn't depend on hand size, distance or tilt.
+# A stretched finger is ~1.9, a finger folded into a fist is ~1.0.
+FIST_RATIO = 1.2    # EVERY finger must be at or below this -> full fist
+OPEN_RATIO = 1.7    # EVERY finger must be at or above this -> fully open hand
+STABLE_FRAMES = 2   # a pose must hold this many frames before it counts
 
 # MediaPipe hand landmark indices
 WRIST = 0
-FINGERS = [(8, 6), (12, 10), (16, 14), (20, 18)]  # (tip, pip) for index..pinky
-THUMB_TIP, THUMB_IP, PINKY_MCP = 4, 3, 17
+FINGERS = [(8, 5), (12, 9), (16, 13), (20, 17)]  # (tip, knuckle) for index..pinky
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -89,8 +92,9 @@ class HandTracker(threading.Thread):
         self._running = True
         self._flaps = 0          # pending flap events not yet consumed by the game
         self.frame = None        # latest RGB frame with landmarks drawn
-        self.hand_state = None   # "open", "closed" or None (no hand)
-        self.fingers = 0
+        self.hand_state = None   # last confirmed pose: "open", "closed" or None (no hand)
+        self.pose = None         # current raw pose: "open", "closed", "partial" or None
+        self.openness = 0.0      # 0 = full fist, 1 = fully open
 
     def stop(self):
         self._running = False
@@ -105,18 +109,18 @@ class HandTracker(threading.Thread):
             return self.frame
 
     @staticmethod
-    def count_extended_fingers(pts):
-        """pts: list of (x, y) pixel coordinates for the 21 landmarks."""
-        def dist(a, b):
-            return math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
+    def finger_ratios(pts):
+        """pts: list of (x, y, z) world coordinates (metres) for the 21 landmarks."""
+        return [math.dist(pts[tip], pts[WRIST]) / math.dist(pts[knuckle], pts[WRIST])
+                for tip, knuckle in FINGERS]
 
-        # A finger is extended when its tip is farther from the wrist than its
-        # middle joint. Using distances makes this work at any hand rotation.
-        count = sum(1 for tip, pip in FINGERS if dist(tip, WRIST) > dist(pip, WRIST) * 1.1)
-        # Thumb: tip far from the base of the pinky means it is sticking out.
-        if dist(THUMB_TIP, PINKY_MCP) > dist(THUMB_IP, PINKY_MCP) * 1.1:
-            count += 1
-        return count
+    @staticmethod
+    def classify(ratios):
+        if max(ratios) <= FIST_RATIO:
+            return "closed"
+        if min(ratios) >= OPEN_RATIO:
+            return "open"
+        return "partial"
 
     def run(self):
         if not self.available:
@@ -131,6 +135,7 @@ class HandTracker(threading.Thread):
         )
         t0 = time.monotonic()
         last_ts = -1
+        last_pose, stable = None, 0
         with vision.HandLandmarker.create_from_options(options) as landmarker:
             while self._running:
                 ok, frame = self.cap.read()
@@ -148,34 +153,42 @@ class HandTracker(threading.Thread):
                 )
 
                 state = self.hand_state
-                fingers = 0
+                pose = None
+                openness = 0.0
+                flapped = False
                 if result.hand_landmarks:
-                    pts = [(lm.x * w, lm.y * h) for lm in result.hand_landmarks[0]]
-                    fingers = self.count_extended_fingers(pts)
-                    if fingers <= CLOSED_MAX_FINGERS:
-                        new_state = "closed"
-                    elif fingers >= OPEN_MIN_FINGERS:
-                        new_state = "open"
-                    else:
-                        new_state = state  # in between: keep previous state
-                    flapped = state == "open" and new_state == "closed"
-                    state = new_state
+                    world = [(lm.x, lm.y, lm.z) for lm in result.hand_world_landmarks[0]]
+                    ratios = self.finger_ratios(world)
+                    span = OPEN_RATIO - FIST_RATIO
+                    openness = sum(min(1.0, max(0.0, (r - FIST_RATIO) / span)) for r in ratios) / len(ratios)
+                    pose = self.classify(ratios)
 
-                    color = (255, 80, 80) if state == "closed" else (80, 255, 120)
-                    ipts = [(int(x), int(y)) for x, y in pts]
+                    stable = stable + 1 if pose == last_pose else 1
+                    last_pose = pose
+                    # Only a fully open or fully closed hand that holds for a few
+                    # frames changes the state; half-closed poses are ignored, so
+                    # the user must open completely before the next flap counts.
+                    if pose != "partial" and pose != state and stable >= STABLE_FRAMES:
+                        flapped = state == "open" and pose == "closed"
+                        state = pose
+
+                    color = {"open": (80, 255, 120), "closed": (255, 80, 80),
+                             "partial": (255, 210, 60)}[pose]
+                    ipts = [(int(lm.x * w), int(lm.y * h)) for lm in result.hand_landmarks[0]]
                     for a, b in HAND_CONNECTIONS:
                         cv2.line(rgb, ipts[a], ipts[b], color, 3)
                     for p in ipts:
                         cv2.circle(rgb, p, 5, (255, 255, 255), -1)
                 else:
-                    flapped = False
                     state = None
+                    last_pose, stable = None, 0
 
                 with self._lock:
                     if flapped:
                         self._flaps += 1
                     self.hand_state = state
-                    self.fingers = fingers
+                    self.pose = pose
+                    self.openness = openness
                     self.frame = rgb
         self.cap.release()
 
@@ -330,14 +343,22 @@ class Game:
         pygame.draw.rect(self.screen, (255, 255, 255), (x, y, PREVIEW_W, PREVIEW_H), 2)
 
         if self.tracker and self.tracker.available:
-            state = self.tracker.hand_state
+            pose = self.tracker.pose
             text, color = {
                 "open": ("Mano ABIERTA", (80, 255, 120)),
                 "closed": ("PUÑO", (255, 90, 90)),
+                "partial": ("Ábrela o ciérrala del todo", (255, 210, 60)),
                 None: ("Sin mano", (220, 220, 220)),
-            }[state]
-            t = self.font_small.render(f"{text}  ({self.tracker.fingers} dedos)", True, color)
-            self.screen.blit(t, (x, y + PREVIEW_H + 4))
+            }[pose]
+            # Openness bar: empty = full fist, full = fully open hand
+            bar_y = y + PREVIEW_H + 6
+            pygame.draw.rect(self.screen, (30, 30, 30), (x, bar_y, PREVIEW_W, 12))
+            if pose is not None:
+                fill = int(PREVIEW_W * self.tracker.openness)
+                pygame.draw.rect(self.screen, color, (x, bar_y, fill, 12))
+            pygame.draw.rect(self.screen, (255, 255, 255), (x, bar_y, PREVIEW_W, 12), 1)
+            t = self.font_small.render(text, True, color)
+            self.screen.blit(t, (x + PREVIEW_W - t.get_width(), bar_y + 16))
 
     def draw(self):
         self.screen.fill((112, 197, 206))
@@ -358,8 +379,8 @@ class Game:
             self.draw_text(str(self.score), self.font_big, 40)
         elif self.state == "ready":
             self.draw_text("FLAPPY HAND", self.font_big, 150, (255, 230, 0))
-            self.draw_text("Abre la mano", self.font, 430)
-            self.draw_text("¡y ciérrala para saltar!", self.font, 462)
+            self.draw_text("Abre la mano por completo", self.font, 430)
+            self.draw_text("¡y cierra el puño para saltar!", self.font, 462)
             self.draw_text("F11: pantalla completa   ESC: salir", self.font_small, 520)
         else:
             self.draw_text("FIN DEL JUEGO", self.font_big, 180, (255, 90, 60))
