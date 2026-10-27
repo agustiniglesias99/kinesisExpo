@@ -32,6 +32,19 @@ downloaded next to the script.
 The camera preview in the top-right corner shows the detected hand
 (green = open, red = fist) and how many fingers are counted as extended.
 
+## High score
+
+The best score is kept in `records.csv` next to the script (one row per new
+record, `fecha_hora;puntaje`, `;`-separated so it opens in columns in Excel).
+Delete the file to reset the record.
+
+## Vertical monitor
+
+The game adapts to the screen's aspect ratio. On a monitor rotated to portrait
+(set the orientation to *Portrait* in Windows display settings) it fills the
+screen in a phone-like layout. `ORIENTATION = "vertical"` forces that layout,
+e.g. to test it in a window on a landscape screen.
+
 ## Tuning
 
 Constants at the top of `flappy_hand.py`:

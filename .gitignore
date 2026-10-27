@@ -13,3 +13,6 @@ hand_landmarker.task
 .idea/
 Thumbs.db
 .DS_Store
+
+# High scores (local to each machine)
+records.csv
