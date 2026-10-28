@@ -1,16 +1,22 @@
 """Flappy Bird controlled by your hand.
 
 Open your hand, then close it into a fist: every open -> closed transition
-makes the bird flap. The webcam is read with OpenCV, hand landmarks come from
-MediaPipe's HandLandmarker and the game is drawn with pygame.
+makes the bird flap. The webcam is read with OpenCV and the game is drawn
+with pygame. Two ways to read the hand:
 
-Keyboard: SPACE also flaps (handy for testing), F11 toggles fullscreen,
-ESC quits.
+  * marker mode: a glove with a fluorescent sticker on each fingertip; the
+    stickers show when the hand is open and hide inside a fist (no AI model).
+  * hand mode: hand landmarks come from MediaPipe's HandLandmarker (bare hand).
+
+Keyboard: SPACE also flaps (handy for testing), G switches marker / hand mode,
+C learns the sticker colour, V enlarges the camera view, S saves a camera
+snapshot, F11 toggles fullscreen, ESC quits.
 
 The best score is stored with its date and time in records.csv.
 """
 
 import csv
+import json
 import math
 import os
 import random
@@ -18,10 +24,12 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 from datetime import datetime
 
 import cv2
 import mediapipe as mp
+import numpy as np
 import pygame
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
@@ -29,7 +37,7 @@ from mediapipe.tasks.python import vision
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -57,9 +65,32 @@ PIPE_INTERVAL = 1.8     # seconds between pipes
 
 PREVIEW_W, PREVIEW_H = 192, 144
 
-# Hysteresis for gesture detection (number of extended fingers)
+TRACKING_MODE = "markers"  # "markers" (stickers on the glove) or "hand" (MediaPipe); G toggles
+STABLE_FRAMES = 2          # a pose must hold this many frames before it counts
+
+# Hand mode: hysteresis on the number of extended fingers
 CLOSED_MAX_FINGERS = 1  # <= this many extended fingers -> fist
 OPEN_MIN_FINGERS = 3    # >= this many extended fingers -> open hand
+
+# Marker mode: a fluorescent sticker on the pad of each fingertip (palm side,
+# facing the camera). Open hand: the camera sees them; fist: the fingertips
+# fold into the palm and the stickers hide. The colour is a hue range in
+# OpenCV's HSV (hue 0-179) plus minimum saturation and brightness. Click a
+# sticker in the camera view (or hold it in the white square in the middle and
+# press C) to learn them from it; they are saved in MARKERS_PATH.
+MARKER_HUE = 165             # defaults until calibrated: fluorescent pink
+MARKER_HUE_TOLERANCE = 10
+MARKER_MIN_SATURATION = 100  # 0-255
+MARKER_MIN_VALUE = 80        # 0-255 (brightness)
+MARKER_MIN_AREA = 40         # px in the 640x480 camera image; smaller specks are noise
+MARKER_MAX_AREA = 4000       # px; a bigger patch of that colour is not a sticker
+MARKER_OPEN_MIN = 3          # >= this many stickers visible -> open hand
+MARKER_FIST_MAX = 1          # <= this many -> fist (also when the hand leaves the view)
+MARKER_SMOOTH_FRAMES = 3     # count = median of the last N frames, filters flicker
+MARKER_TARGET = 16           # px; side of the calibration square
+MARKER_SAMPLE_RADIUS = 4     # px; calibration samples a (2r+1)^2 patch of the sticker
+MARKERS_PATH = os.path.join(BASE_DIR, "marcadores.json")
+SNAPSHOT_DIR = os.path.join(BASE_DIR, "capturas")  # S saves camera frames here
 
 # MediaPipe hand landmark indices
 WRIST = 0
@@ -73,7 +104,8 @@ HAND_CONNECTIONS = [
     (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
 ]
 
-OPEN_COLOR, CLOSED_COLOR = (80, 255, 120), (255, 80, 80)
+OPEN_COLOR, CLOSED_COLOR, PARTIAL_COLOR = (80, 255, 120), (255, 80, 80), (255, 210, 60)
+POSE_COLORS = {"open": OPEN_COLOR, "closed": CLOSED_COLOR, "partial": PARTIAL_COLOR}
 
 
 def ensure_model():
@@ -127,6 +159,28 @@ def format_when(when):
 
 
 # ----------------------------------------------------------------------------
+# Sticker colour (marcadores.json, written when calibrating with C)
+# ----------------------------------------------------------------------------
+def load_marker_color():
+    color = {"hue": MARKER_HUE, "tolerance": MARKER_HUE_TOLERANCE,
+             "min_saturation": MARKER_MIN_SATURATION, "min_value": MARKER_MIN_VALUE}
+    try:
+        with open(MARKERS_PATH, encoding="utf-8") as f:
+            color.update({k: int(v) for k, v in json.load(f).items() if k in color})
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # no calibration yet (or a damaged file): use the defaults
+    return color
+
+
+def save_marker_color(color):
+    try:
+        with open(MARKERS_PATH, "w", encoding="utf-8") as f:
+            json.dump(color, f, indent=2)
+    except OSError as exc:
+        print("No se pudo guardar la calibración:", exc)
+
+
+# ----------------------------------------------------------------------------
 # Hand tracking (runs in a background thread so the game stays smooth)
 # ----------------------------------------------------------------------------
 class HandTracker(threading.Thread):
@@ -141,12 +195,32 @@ class HandTracker(threading.Thread):
         self._lock = threading.Lock()
         self._running = True
         self._flaps = 0          # pending flap events not yet consumed by the game
-        self.frame = None        # latest RGB frame with landmarks drawn
-        self.hand_state = None   # "open", "closed" or None (no hand)
-        self.fingers = 0
+        self.frame = None        # latest RGB frame with landmarks / stickers drawn
+        self.mode = TRACKING_MODE
+        self.marker_color = load_marker_color()
+        self.hand_state = None   # last confirmed pose: "open", "closed" or None (no hand)
+        self.pose = None         # current raw pose: "open", "closed", "partial" or None
+        self.fingers = 0         # hand mode: extended fingers
+        self.markers = 0         # marker mode: stickers visible
+        self.openness = 0.0      # 0 = full fist, 1 = fully open
+        self.notice = None       # (message, show until) for calibration feedback
+        self._counts = deque(maxlen=MARKER_SMOOTH_FRAMES)
+        self._calibrate = None   # camera pixel to learn the sticker colour from, or "center"
+        self._snapshot = False
 
     def stop(self):
         self._running = False
+
+    def toggle_mode(self):
+        self.mode = "hand" if self.mode == "markers" else "markers"
+
+    def calibrate(self, point=None):
+        """Learn the sticker colour at point (x, y in the camera image) on the
+        next frame; None = the white square in the middle."""
+        self._calibrate = point or "center"
+
+    def snapshot(self):
+        self._snapshot = True  # saved on the next frame
 
     def consume_flaps(self):
         with self._lock:
@@ -171,20 +245,130 @@ class HandTracker(threading.Thread):
             count += 1
         return count
 
+    def detect_hand(self, result, rgb):
+        """Classify a MediaPipe result and draw the landmarks on rgb.
+        Returns (pose, extended fingers)."""
+        if not result.hand_landmarks:
+            return None, 0
+        h, w = rgb.shape[:2]
+        pts = [(lm.x * w, lm.y * h) for lm in result.hand_landmarks[0]]
+        fingers = self.count_extended_fingers(pts)
+        if fingers <= CLOSED_MAX_FINGERS:
+            pose = "closed"
+        elif fingers >= OPEN_MIN_FINGERS:
+            pose = "open"
+        else:
+            pose = "partial"
+
+        ipts = [(int(x), int(y)) for x, y in pts]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(rgb, ipts[a], ipts[b], POSE_COLORS[pose], 3)
+        for p in ipts:
+            cv2.circle(rgb, p, 5, (255, 255, 255), -1)
+        return pose, fingers
+
+    def detect_markers(self, frame, rgb):
+        """Count the coloured stickers in the BGR frame and circle them on rgb.
+        Returns (pose, stickers visible)."""
+        hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        if self._calibrate:
+            point, self._calibrate = self._calibrate, None
+            self.calibrate_marker(hsv, *((w // 2, h // 2) if point == "center" else point))
+
+        stickers, ignored = self.find_stickers(hsv)
+        self._counts.append(len(stickers))
+        count = int(np.median(self._counts))
+        if count >= MARKER_OPEN_MIN:
+            pose = "open"
+        elif count <= MARKER_FIST_MAX:
+            pose = "closed"
+        else:
+            pose = "partial"
+
+        # Stickers circled in the pose colour; same-coloured spots that are too
+        # small or too big in grey, so stray objects are easy to spot
+        for c, color in [(c, POSE_COLORS[pose]) for c in stickers] + [(c, (150, 150, 150)) for c in ignored]:
+            if cv2.contourArea(c) < 4:
+                continue
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            cv2.circle(rgb, (int(cx), int(cy)), int(r) + 6, color, 3)
+        half = MARKER_TARGET // 2
+        cv2.rectangle(rgb, (w // 2 - half, h // 2 - half), (w // 2 + half, h // 2 + half), (255, 255, 255), 2)
+        return pose, count
+
+    def find_stickers(self, hsv):
+        """Blobs of the sticker colour: (sticker-sized, too small or too big)."""
+        col = self.marker_color
+        hue_diff = np.abs(hsv[:, :, 0].astype(np.int16) - col["hue"])
+        hue_diff = np.minimum(hue_diff, 180 - hue_diff)  # hue is circular: 179 is next to 0
+        mask = ((hue_diff <= col["tolerance"]) & (hsv[:, :, 1] >= col["min_saturation"])
+                & (hsv[:, :, 2] >= col["min_value"])).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        stickers, ignored = [], []
+        for c in contours:
+            (stickers if MARKER_MIN_AREA <= cv2.contourArea(c) <= MARKER_MAX_AREA else ignored).append(c)
+        return stickers, ignored
+
+    def calibrate_marker(self, hsv, x, y):
+        """Learn the sticker colour from a small patch around camera pixel (x, y)."""
+        h, w = hsv.shape[:2]
+        r = MARKER_SAMPLE_RADIUS
+        x, y = min(max(int(x), r), w - r - 1), min(max(int(y), r), h - r - 1)
+        patch = hsv[y - r:y + r + 1, x - r:x + r + 1].reshape(-1, 3).astype(np.float64)
+        sat, val = np.percentile(patch[:, 1], 10), np.percentile(patch[:, 2], 10)
+        if sat < 40 or val < 100:  # fluorescent stickers are vivid and bright; the glove isn't
+            self.notice = ("Ahí no hay un color vivo", time.monotonic() + 4)
+            print("Calibración ignorada: haz clic justo sobre el sticker")
+            return
+        # Circular mean of the hue, so reds around 179/0 average correctly
+        angle = patch[:, 0] * np.pi / 90
+        hue = int(round(np.arctan2(np.sin(angle).mean(), np.cos(angle).mean()) * 90 / np.pi)) % 180
+        hue_diff = np.abs(patch[:, 0] - hue)
+        hue_diff = np.minimum(hue_diff, 180 - hue_diff)
+        # Ranges just wide enough for the sticker (with margin for it turning
+        # or moving away from the light), so the background stays out
+        self.marker_color = {"hue": hue,
+                             "tolerance": int(np.clip(np.percentile(hue_diff, 90) + 4, 5, 15)),
+                             "min_saturation": int(max(30, sat * 0.75)),
+                             "min_value": int(max(60, val * 0.8))}
+        save_marker_color(self.marker_color)
+        print("Color de los marcadores calibrado:", self.marker_color)
+
+        others = [c for c in self.find_stickers(hsv)[0] if cv2.pointPolygonTest(c, (x, y), False) < 0]
+        if others:
+            self.notice = (f"Ojo: {len(others)} manchas de ese color fuera del sticker", time.monotonic() + 6)
+        else:
+            self.notice = (f"Color calibrado (tono {hue})", time.monotonic() + 4)
+
+    def save_snapshot(self, frame, rgb, pose, value):
+        """Save the raw camera frame and the annotated view, to tune the
+        detection offline."""
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        name = f"{datetime.now():%Y%m%d_%H%M%S_%f}_{self.mode}_{pose}_{value}"
+        cv2.imwrite(os.path.join(SNAPSHOT_DIR, name + "_raw.png"), frame)
+        cv2.imwrite(os.path.join(SNAPSHOT_DIR, name + "_vista.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        print("Captura guardada:", name)
+
     def run(self):
         if not self.available:
             return
-        options = vision.HandLandmarkerOptions(
-            base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
-            min_hand_detection_confidence=0.6,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        landmarker = None
+        if os.path.exists(MODEL_PATH):
+            options = vision.HandLandmarkerOptions(
+                base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=vision.RunningMode.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=0.6,
+                min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            landmarker = vision.HandLandmarker.create_from_options(options)
         t0 = time.monotonic()
         last_ts = -1
-        with vision.HandLandmarker.create_from_options(options) as landmarker:
+        mode, state, last_pose, stable = self.mode, None, None, 0
+        try:
             while self._running:
                 ok, frame = self.cap.read()
                 if not ok:
@@ -192,45 +376,50 @@ class HandTracker(threading.Thread):
                     continue
                 frame = cv2.flip(frame, 1)  # mirror, feels natural
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                h, w = rgb.shape[:2]
 
-                ts = max(int((time.monotonic() - t0) * 1000), last_ts + 1)
-                last_ts = ts
-                result = landmarker.detect_for_video(
-                    mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts
-                )
+                if self.mode != mode:  # switched with G: start over
+                    mode, state, last_pose, stable = self.mode, None, None, 0
+                    self._counts.clear()
 
-                state = self.hand_state
-                fingers = 0
-                if result.hand_landmarks:
-                    pts = [(lm.x * w, lm.y * h) for lm in result.hand_landmarks[0]]
-                    fingers = self.count_extended_fingers(pts)
-                    if fingers <= CLOSED_MAX_FINGERS:
-                        new_state = "closed"
-                    elif fingers >= OPEN_MIN_FINGERS:
-                        new_state = "open"
-                    else:
-                        new_state = state  # in between: keep previous state
-                    flapped = state == "open" and new_state == "closed"
-                    state = new_state
+                pose, fingers, markers, openness = None, 0, 0, 0.0
+                if mode == "markers":
+                    pose, markers = self.detect_markers(frame, rgb)
+                    openness = min(1.0, markers / 5)
+                elif landmarker:
+                    ts = max(int((time.monotonic() - t0) * 1000), last_ts + 1)
+                    last_ts = ts
+                    result = landmarker.detect_for_video(
+                        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts
+                    )
+                    pose, fingers = self.detect_hand(result, rgb)
+                    openness = fingers / 5
 
-                    color = CLOSED_COLOR if state == "closed" else OPEN_COLOR
-                    ipts = [(int(x), int(y)) for x, y in pts]
-                    for a, b in HAND_CONNECTIONS:
-                        cv2.line(rgb, ipts[a], ipts[b], color, 3)
-                    for p in ipts:
-                        cv2.circle(rgb, p, 5, (255, 255, 255), -1)
-                else:
-                    flapped = False
-                    state = None
+                stable = stable + 1 if pose == last_pose else 1
+                last_pose = pose
+                # Only a fully open or fully closed hand that holds for a few
+                # frames changes the state, so one bad frame can't flap.
+                flapped = False
+                if pose != "partial" and pose != state and stable >= STABLE_FRAMES:
+                    flapped = state == "open" and pose == "closed"
+                    state = pose
+
+                if self._snapshot:
+                    self._snapshot = False
+                    self.save_snapshot(frame, rgb, pose, markers if mode == "markers" else fingers)
 
                 with self._lock:
                     if flapped:
                         self._flaps += 1
                     self.hand_state = state
+                    self.pose = pose
                     self.fingers = fingers
+                    self.markers = markers
+                    self.openness = openness
                     self.frame = rgb
-        self.cap.release()
+        finally:
+            if landmarker:
+                landmarker.close()
+            self.cap.release()
 
 
 # ----------------------------------------------------------------------------
@@ -320,6 +509,8 @@ class Game:
         self.tracker = tracker
         self.best, self.best_when = load_record()
         self.new_record = False
+        self.big_preview = False  # V: double-size camera view, handy to calibrate
+        self.preview_rect = None  # where the camera view was drawn (for clicks)
         self.ground_offset = 0.0
         self.reset()
 
@@ -382,29 +573,60 @@ class Game:
         self.screen.blit(shadow, (x + 2, int(y) + 2))
         self.screen.blit(label, (x, int(y)))
 
+    def on_preview_click(self, pos):
+        """A click on a sticker in the camera view learns its colour."""
+        frame = self.tracker.get_preview() if self.tracker else None
+        r = self.preview_rect
+        if frame is None or r is None or not r.collidepoint(pos) or self.tracker.mode != "markers":
+            return
+        h, w = frame.shape[:2]
+        self.tracker.calibrate(((pos[0] - r.x) * w / r.width, (pos[1] - r.y) * h / r.height))
+
     def draw_preview(self):
         frame = self.tracker.get_preview() if self.tracker else None
-        x, y = WIDTH - PREVIEW_W - 10, 10
+        scale = 2 if self.big_preview else 1
+        pw, ph = PREVIEW_W * scale, PREVIEW_H * scale
+        x, y = WIDTH - pw - 10, 10
+        self.preview_rect = pygame.Rect(x, y, pw, ph)
         if frame is not None:
             h, w = frame.shape[:2]
             surf = pygame.image.frombuffer(frame.tobytes(), (w, h), "RGB")
-            self.screen.blit(pygame.transform.smoothscale(surf, (PREVIEW_W, PREVIEW_H)), (x, y))
+            self.screen.blit(pygame.transform.smoothscale(surf, (pw, ph)), (x, y))
         else:
-            pygame.draw.rect(self.screen, (30, 30, 30), (x, y, PREVIEW_W, PREVIEW_H))
+            pygame.draw.rect(self.screen, (30, 30, 30), (x, y, pw, ph))
             msg = "Sin cámara" if not (self.tracker and self.tracker.available) else "Iniciando..."
             t = self.font_small.render(msg, True, (220, 220, 220))
-            self.screen.blit(t, (x + 10, y + PREVIEW_H // 2 - 8))
-        pygame.draw.rect(self.screen, (255, 255, 255), (x, y, PREVIEW_W, PREVIEW_H), 2)
+            self.screen.blit(t, (x + 10, y + ph // 2 - 8))
+        pygame.draw.rect(self.screen, (255, 255, 255), (x, y, pw, ph), 2)
 
-        if self.tracker and self.tracker.available:
-            state = self.tracker.hand_state
-            text, color = {
-                "open": ("Mano ABIERTA", OPEN_COLOR),
-                "closed": ("PUÑO", CLOSED_COLOR),
-                None: ("Sin mano", (220, 220, 220)),
-            }[state]
-            t = self.font_small.render(f"{text}  ({self.tracker.fingers} dedos)", True, color)
-            self.screen.blit(t, (x, y + PREVIEW_H + 4))
+        if not (self.tracker and self.tracker.available):
+            return
+        pose = self.tracker.pose
+        text, color = {
+            "open": ("ABIERTA", OPEN_COLOR),
+            "closed": ("PUÑO", CLOSED_COLOR),
+            "partial": ("A medias", PARTIAL_COLOR),
+            None: ("Sin mano", (220, 220, 220)),
+        }[pose]
+        # Openness bar: empty = full fist, full = fully open hand
+        bar_y = y + ph + 6
+        pygame.draw.rect(self.screen, (30, 30, 30), (x, bar_y, pw, 10))
+        if pose is not None:
+            pygame.draw.rect(self.screen, color, (x, bar_y, int(pw * self.tracker.openness), 10))
+        pygame.draw.rect(self.screen, (255, 255, 255), (x, bar_y, pw, 10), 1)
+
+        if self.tracker.mode == "markers":
+            notice = self.tracker.notice
+            second = (notice[0] if notice and time.monotonic() < notice[1]
+                      else "Clic en un sticker: calibrar color")
+            lines = [(f"{text}  ({self.tracker.markers} marcas)", color),
+                     (second, (220, 220, 220))]
+        else:
+            lines = [(f"{text}  ({self.tracker.fingers} dedos)", color),
+                     ("Mano (MediaPipe)", (220, 220, 220))]
+        for i, (line, line_color) in enumerate(lines):
+            t = self.font_small.render(line, True, line_color)
+            self.screen.blit(t, (x + pw - t.get_width(), bar_y + 14 + i * 18))
 
     def draw(self):
         self.screen.fill((112, 197, 206))
@@ -434,6 +656,8 @@ class Game:
             self.draw_text("Abre la mano", self.font, HEIGHT * 0.60)
             self.draw_text("¡y ciérrala para saltar!", self.font, HEIGHT * 0.60 + 30)
             self.draw_text("F11: pantalla completa   ESC: salir", self.font_small, HEIGHT * 0.60 + 80)
+            self.draw_text("Clic en sticker: calibrar   G: marcas / mano", self.font_small, HEIGHT * 0.60 + 102)
+            self.draw_text("V: vista grande   S: guardar captura", self.font_small, HEIGHT * 0.60 + 124)
         else:
             self.draw_text("FIN DEL JUEGO", self.font_big, HEIGHT * 0.30, (255, 90, 60))
             self.draw_text(f"Puntos: {self.score}", self.font, HEIGHT * 0.30 + 76)
@@ -454,6 +678,9 @@ class Game:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     return
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.on_preview_click(event.pos)
+                    continue
                 if event.type != pygame.KEYDOWN:
                     continue
                 if event.key == pygame.K_ESCAPE:
@@ -462,6 +689,14 @@ class Game:
                     self.on_flap()
                 elif event.key == pygame.K_F11:
                     pygame.display.toggle_fullscreen()
+                elif event.key == pygame.K_v:
+                    self.big_preview = not self.big_preview
+                elif self.tracker and event.key == pygame.K_g:
+                    self.tracker.toggle_mode()
+                elif self.tracker and event.key == pygame.K_c:
+                    self.tracker.calibrate()
+                elif self.tracker and event.key == pygame.K_s:
+                    self.tracker.snapshot()
             if self.tracker:
                 for _ in range(self.tracker.consume_flaps()):
                     self.on_flap()
@@ -473,6 +708,9 @@ def main():
     tracker = None
     try:
         ensure_model()
+    except Exception as exc:  # e.g. no internet: marker mode doesn't need the model
+        print("Sin modelo de MediaPipe, el modo mano no funcionará:", exc)
+    try:
         tracker = HandTracker()
         if tracker.available:
             tracker.start()
